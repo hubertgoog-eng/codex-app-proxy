@@ -3,6 +3,7 @@ set -euo pipefail
 umask 077
 
 server_ip="${1:-}"
+resume_mode="${2:-}"
 if [[ $EUID -ne 0 ]]; then
   echo '请以 root 身份运行。' >&2
   exit 1
@@ -12,8 +13,10 @@ if [[ ! $server_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 if [[ -e /usr/local/bin/xray || -e /usr/local/etc/xray/config.json ]]; then
-  echo '检测到现有 Xray 安装或配置。为避免覆盖，脚本已停止。' >&2
-  exit 1
+  if [[ $resume_mode != --resume ]]; then
+    echo '检测到现有 Xray。若要接续之前失败的安装，请在命令末尾加 --resume。' >&2
+    exit 1
+  fi
 fi
 if ss -H -ltn | awk '$4 ~ /:443$/ {found=1} END {exit !found}'; then
   ssh_ports=/etc/ssh/sshd_config.d/ports.conf
@@ -43,27 +46,35 @@ if ss -H -ltn | awk '$4 ~ /:443$/ {found=1} END {exit !found}'; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y ca-certificates curl openssl
+if [[ $resume_mode != --resume ]]; then
+  apt-get update
+  apt-get install -y ca-certificates curl openssl
+fi
 
-installer=$(mktemp)
-trap 'rm -f "$installer"' EXIT
-curl -fsSL 'https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh' -o "$installer"
-bash "$installer" install
+if [[ ! -x /usr/local/bin/xray ]]; then
+  installer=$(mktemp)
+  trap 'rm -f "$installer"' EXIT
+  curl -fsSL 'https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh' -o "$installer"
+  bash "$installer" install
+fi
 
 xray=/usr/local/bin/xray
 config=/usr/local/etc/xray/config.json
-uuid=$($xray uuid)
+uuid=$(cat /proc/sys/kernel/random/uuid)
 key_output=$($xray x25519)
-private_key=$(printf '%s\n' "$key_output" | sed -nE 's/^(Private key|PrivateKey):[[:space:]]*([^[:space:]]+).*/\2/p' | head -n 1)
-public_key=$(printf '%s\n' "$key_output" | sed -nE 's/^(Public key|PublicKey|Password):[[:space:]]*([^[:space:]]+).*/\2/p' | head -n 1)
+mapfile -t keys < <(printf '%s\n' "$key_output" | grep -oE '[A-Za-z0-9_-]{43}' | head -n 2)
+private_key=${keys[0]:-}
+public_key=${keys[1]:-}
 short_id=$(openssl rand -hex 8)
 if [[ -z $uuid || -z $private_key || -z $public_key || -z $short_id ]]; then
-  echo '生成连接参数失败；请勿继续使用此安装。' >&2
+  echo '生成连接参数失败；没有修改 Xray 配置。' >&2
+  printf '%s\n' "$key_output" | awk -F: 'NF>1 {print "Xray field: " $1} NF==1 {print "Xray field: (unlabeled)"}' >&2
   exit 1
 fi
 
-cat > "$config" <<EOF
+new_config=$(mktemp --suffix=.json "${config}.new.XXXXXX")
+trap 'rm -f "$new_config"' EXIT
+cat > "$new_config" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [
@@ -95,14 +106,22 @@ EOF
 service_user=$(systemctl show -p User --value xray)
 service_user=${service_user:-root}
 service_group=$(id -gn "$service_user")
-chown "root:$service_group" "$config"
-chmod 640 "$config"
+chown "root:$service_group" "$new_config"
+chmod 640 "$new_config"
 
-$xray run -test -config "$config"
-systemctl enable --now xray
-systemctl restart xray
-if ! systemctl is-active --quiet xray; then
-  echo 'Xray 未能启动。请运行 journalctl -u xray -n 40 --no-pager 查看错误。' >&2
+$xray run -test -config "$new_config"
+if [[ -f $config ]]; then
+  backup="${config}.backup.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -a "$config" "$backup"
+  echo "原配置已备份到 $backup"
+fi
+mv -f "$new_config" "$config"
+if ! systemctl enable --now xray || ! systemctl restart xray || ! systemctl is-active --quiet xray; then
+  if [[ -n ${backup:-} ]]; then
+    cp -a "$backup" "$config"
+    systemctl restart xray || true
+  fi
+  echo 'Xray 未能启动；已尝试恢复原配置。请运行 journalctl -u xray -n 40 --no-pager 查看错误。' >&2
   exit 1
 fi
 if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
