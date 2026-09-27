@@ -147,4 +147,3 @@ echo
 echo '服务端安装完成；Xray 正在运行。'
 echo '请确认 VPS 服务商的防火墙也允许入站 TCP 443。'
 echo "连接参数已保存到 $connection_file"
-
