@@ -1,0 +1,73 @@
+name: Compare v1.1.5 With Official Release
+
+on:
+  push:
+    branches:
+      - verify-v1.1.5
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Download official v1.1.5 release
+        shell: pwsh
+        run: |
+          $url = "https://github.com/leisair/codex-app-proxy/releases/download/v1.1.5/ChatGPT-Codex-Proxy-Launcher-v1.1.5-windows-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile official.zip
+          Expand-Archive -LiteralPath official.zip -DestinationPath official
+
+      - name: Compare binaries
+        shell: pwsh
+        run: |
+          $built = "build\Release\CodexProxyLauncher.exe"
+          $official = "official\CodexProxyLauncher.exe"
+          $builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash.ToLowerInvariant()
+          $officialHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $official).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath official.zip).Hash.ToLowerInvariant()
+          $builtSize = (Get-Item $built).Length
+          $officialSize = (Get-Item $official).Length
+          $identical = $false
+          if ($builtSize -eq $officialSize) {
+            $a = [System.IO.File]::ReadAllBytes($built)
+            $b = [System.IO.File]::ReadAllBytes($official)
+            $identical = [System.Linq.Enumerable]::SequenceEqual([byte[]]$a, [byte[]]$b)
+          }
+          @"
+          source_commit=3fad3b0f6a809b0cc27c50c3ebb0a4359da9daab
+          independently_built_exe_sha256=$builtHash
+          official_release_exe_sha256=$officialHash
+          official_release_zip_sha256=$zipHash
+          independently_built_exe_size=$builtSize
+          official_release_exe_size=$officialSize
+          byte_for_byte_identical=$identical
+          "@ | Set-Content -Encoding ascii comparison.txt
+          Get-Content comparison.txt
+
+      - name: Upload comparison report
+        uses: actions/upload-artifact@v7
+        with:
+          name: v1.1.5-comparison-report
+          path: comparison.txt
+          if-no-files-found: error
