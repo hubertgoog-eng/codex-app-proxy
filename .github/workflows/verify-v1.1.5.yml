@@ -1,0 +1,68 @@
+name: Independent v1.1.5 Verification Build
+
+on:
+  push:
+    branches:
+      - verify-v1.1.5
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Verify source icon
+        shell: pwsh
+        run: .\tests\verify-icon.ps1 resources\windows\codex-proxy.ico
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Test C++
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify offline guide
+        shell: pwsh
+        run: node tests/verify-start-here.mjs resources/START-HERE.html resources/default_config.json
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item -Force build\Release\CodexProxyLauncher.exe out\
+          Copy-Item -Force resources\START-HERE.html out\
+          Copy-Item -Force resources\default_config.json out\config.json
+          Copy-Item -Force README.md out\
+
+      - name: Verify package contents
+        shell: pwsh
+        run: .\tests\verify-package.ps1 -Path out
+
+      - name: Compute hashes
+        shell: pwsh
+        run: |
+          $exe = Get-FileHash -Algorithm SHA256 -LiteralPath out\CodexProxyLauncher.exe
+          "$($exe.Hash.ToLowerInvariant())  CodexProxyLauncher.exe" | Set-Content -Encoding ascii out\SHA256SUMS.txt
+          Get-Content out\SHA256SUMS.txt
+
+      - name: Upload independent build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-app-proxy-v1.1.5-independent-windows-x64
+          path: out/*
+          if-no-files-found: error
